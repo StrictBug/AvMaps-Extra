@@ -11,7 +11,14 @@
     <header>
         <div class="title-section">
             <h1>AvMaps Extra</h1>
-            <button id="info-btn" class="info-btn" type="button" aria-label="Show keyboard controls" title="Keyboard controls">i</button>
+            <div class="title-actions">
+                <button id="sounding-tool-btn" class="tool-btn" type="button" aria-pressed="false" aria-label="Toggle sounding tool" title="Sounding tool">
+                    <svg class="balloon-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <path d="M12 1.8c-3.7 0-6.7 3.1-6.7 7 0 3.2 2.1 5.9 5.1 6.7L9.2 21.2h5.6l-1.2-5.7c3-.8 5.1-3.5 5.1-6.7 0-3.9-3-7-6.7-7zm0 2.2c2.5 0 4.5 2.1 4.5 4.8S14.5 13.6 12 13.6 7.5 11.5 7.5 8.8 9.5 4 12 4z"/>
+                    </svg>
+                </button>
+                <button id="info-btn" class="info-btn" type="button" aria-label="Show keyboard controls" title="Keyboard controls">i</button>
+            </div>
         </div>
         <div class="domain-section">
             <div class="domain-buttons">
@@ -33,13 +40,51 @@
 
     <main class="main-content">
         <div class="image-container">
-            <div class="image-pair">
-                <div class="image-panel left-panel">
-                    <img id="left-image" src="" alt="Freezing level">
+            <div class="map-workspace">
+                <div class="image-pair" id="image-pair">
+                    <div class="image-panel left-panel">
+                        <button class="map-expand-btn" type="button" data-expand-panel="left" aria-pressed="false" aria-label="Expand freezing level map" title="Expand map">
+                            <svg class="map-expand-icon expand" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                                <path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <svg class="map-expand-icon collapse" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                                <path d="M6 2v4H2M10 2v4h4M14 10h-4v4M2 10h4v4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                        <img id="left-image" src="" alt="Freezing level">
+                    </div>
+                    <div class="image-panel right-panel">
+                        <button class="map-expand-btn" type="button" data-expand-panel="right" aria-pressed="false" aria-label="Expand 4C isotherm map" title="Expand map">
+                            <svg class="map-expand-icon expand" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                                <path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                            <svg class="map-expand-icon collapse" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                                <path d="M6 2v4H2M10 2v4h4M14 10h-4v4M2 10h4v4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </button>
+                        <img id="right-image" src="" alt="4C isotherm height">
+                    </div>
                 </div>
-                <div class="image-panel right-panel">
-                    <img id="right-image" src="" alt="4C isotherm height">
-                </div>
+                <div
+                    id="sounding-resize-handle"
+                    class="sounding-resize-handle hidden"
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label="Resize sounding panel"
+                    aria-controls="sounding-panel"
+                    tabindex="0"
+                ></div>
+                <aside id="sounding-panel" class="sounding-panel hidden" aria-hidden="true" aria-label="Sounding diagram">
+                    <div class="sounding-panel-header">
+                        <p id="sounding-meta" class="sounding-meta">Enable the balloon tool, then click a map point.</p>
+                        <button id="sounding-close-btn" class="sounding-close-btn" type="button" aria-label="Close sounding panel">×</button>
+                    </div>
+                    <p id="sounding-status" class="sounding-status" aria-live="polite"></p>
+                    <div class="sounding-canvas-wrap">
+                        <canvas id="sounding-canvas" class="sounding-canvas" width="480" height="640"></canvas>
+                        <div id="sounding-hover" class="sounding-hover hidden" aria-live="polite"></div>
+                    </div>
+                </aside>
             </div>
         </div>
     </main>
@@ -73,8 +118,15 @@
                 <p><span class="key-chip">←</span> Previous frame</p>
                 <p><span class="key-chip">→</span> Next frame</p>
             </div>
+
+            <div class="info-section">
+                <h3>Sounding</h3>
+                <p><span class="key-chip">S</span> Toggle sounding tool</p>
+            </div>
         </div>
     </div>
+    <div id="sounding-pin-left" class="sounding-pin hidden" aria-hidden="true"></div>
+    <div id="sounding-pin-right" class="sounding-pin hidden" aria-hidden="true"></div>
 
     <div class="controls">
             <div class="legend-strip" id="legend-strip" aria-live="polite">
@@ -125,6 +177,7 @@
             </div>
         </div>
 
+    <script src="sounding.js"></script>
     <script src="script.js"></script>
 </body>
 </html>

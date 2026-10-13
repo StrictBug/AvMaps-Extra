@@ -16,6 +16,7 @@ The main multi-map product remains [AvMaps](https://github.com/StrictBug/AvMaps)
 - One category pair: FZL + 4°C isotherm height
 - Domains: `AU`, `WA_SA`, `VIC_TAS`, `NSW`
 - Forecast hours 9–48 (hourly CI refresh)
+- Toggle the balloon icon, then click either map for a right-hand Skew-T / log-P (Open-Meteo GFS)
 
 ## Local generation
 

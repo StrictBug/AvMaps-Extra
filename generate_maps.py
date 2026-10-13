@@ -22,6 +22,7 @@ import requests
 import re
 from concurrent.futures import ThreadPoolExecutor
 from scipy.spatial import cKDTree
+from scipy import ndimage
 import pandas as pd
 
 # Define the Australia domain
@@ -148,7 +149,7 @@ LEGEND_CONFIG = {
                     'label': 'Marginal icing',
                     'units': 'hatch',
                     'items': [
-                        {'pattern': 'crosshatch', 'label': 'Mean RH 95%+ between 0C and 4C'},
+                        {'pattern': 'crosshatch', 'label': 'Max mean RH 92%+ in 0–4C or -5–0C'},
                     ],
                 },
             ],
@@ -167,6 +168,8 @@ BASE_FIGURE_WIDTH_INCHES = 12
 BASE_FIGURE_HEIGHT_INCHES = 10
 OUTPUT_MAX_WIDTH_PX = 1280
 OUTPUT_DPI = OUTPUT_MAX_WIDTH_PX / BASE_FIGURE_WIDTH_INCHES
+# Must match savefig(bbox_inches='tight') padding used by save_output_figure.
+SAVEFIG_PAD_INCHES = 0.1
 
 # On-disk cache for downloaded ICON GRIB2 files.  Each entry is the raw
 # decompressed bytes keyed by run_stamp + folder + filename so that repeated
@@ -195,11 +198,76 @@ def safe_remove_file(path):
         pass
 
 
+def measure_axes_image_fraction(fig, ax, pad_inches=SAVEFIG_PAD_INCHES):
+    """Return axes box as fractions of the saved tight-cropped image (top-left origin).
+
+    Includes the same pad_inches that savefig applies around bbox_inches='tight',
+    otherwise click mapping drifts once maps are letterboxed/resized in the viewer.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    tight_bbox = fig.get_tightbbox(renderer)
+    if tight_bbox is None:
+        return {'left': 0.0, 'top': 0.0, 'width': 1.0, 'height': 1.0}
+
+    tight_disp = tight_bbox.transformed(fig.dpi_scale_trans)
+    ax_disp = ax.get_window_extent(renderer)
+    pad_px = float(pad_inches) * float(fig.dpi)
+    width = max(float(tight_disp.width) + 2.0 * pad_px, 1e-6)
+    height = max(float(tight_disp.height) + 2.0 * pad_px, 1e-6)
+
+    left = (pad_px + float(ax_disp.x0) - float(tight_disp.x0)) / width
+    # Image y grows downward; matplotlib display y grows upward.
+    top = (pad_px + float(tight_disp.y1) - float(ax_disp.y1)) / height
+    axes_width = float(ax_disp.width) / width
+    axes_height = float(ax_disp.height) / height
+
+    return {
+        'left': float(np.clip(left, 0.0, 1.0)),
+        'top': float(np.clip(top, 0.0, 1.0)),
+        'width': float(np.clip(axes_width, 0.0, 1.0)),
+        'height': float(np.clip(axes_height, 0.0, 1.0)),
+    }
+
+
+def calibrate_domain_georef():
+    """Build per-domain lon/lat extents and shared axes image fraction for click mapping."""
+    sample_extent = get_domain_extent('AU')
+    fig = plt.figure(figsize=(BASE_FIGURE_WIDTH_INCHES, BASE_FIGURE_HEIGHT_INCHES))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent(
+        [sample_extent[0], sample_extent[1], sample_extent[2], sample_extent[3]],
+        crs=ccrs.PlateCarree(),
+    )
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.8)
+    ax.set_title(
+        'GFS Freezing Level\n'
+        'Run: 2026-01-01 0000Z | Valid: 2026-01-01 0900Z'
+    )
+    axes_fraction = measure_axes_image_fraction(fig, ax)
+    plt.close(fig)
+
+    domains = {}
+    for domain_id in normalize_domain_ids():
+        lon_min, lon_max, lat_min, lat_max = get_domain_extent(domain_id)
+        domains[domain_id] = {
+            'extent': {
+                'lonMin': float(lon_min),
+                'lonMax': float(lon_max),
+                'latMin': float(lat_min),
+                'latMax': float(lat_max),
+            },
+            'axesFraction': axes_fraction,
+        }
+    return domains
+
+
 def save_output_figure(fig, filepath):
     fig.savefig(
         filepath,
         dpi=OUTPUT_DPI,
         bbox_inches='tight',
+        pad_inches=SAVEFIG_PAD_INCHES,
         format=OUTPUT_IMAGE_FORMAT,
         pil_kwargs={
             'quality': OUTPUT_JPEG_QUALITY,
@@ -207,6 +275,51 @@ def save_output_figure(fig, filepath):
             'progressive': True,
         },
     )
+
+
+def style_height_contour_labels(contour_set, labels, cmap, norm, darken_factor=0.55):
+    """Keep each label's colormap hue, but darken RGB for readability."""
+    label_texts = getattr(contour_set, 'labelTexts', None) or list(labels or [])
+    label_values = getattr(contour_set, 'labelCValues', None)
+
+    for index, label in enumerate(label_texts):
+        if label_values is not None and index < len(label_values):
+            base_rgba = cmap(norm(label_values[index]))
+        else:
+            base_rgba = label.get_color()
+            if isinstance(base_rgba, str):
+                from matplotlib.colors import to_rgba
+                base_rgba = to_rgba(base_rgba)
+
+        darker = (
+            float(base_rgba[0]) * darken_factor,
+            float(base_rgba[1]) * darken_factor,
+            float(base_rgba[2]) * darken_factor,
+            1.0,
+        )
+        label.set_color(darker)
+        label.set_alpha(1.0)
+        label.set_zorder(50.1)
+
+
+def draw_height_isolines_with_labels(ax, longitude, latitude, height_ft, cmap, norm):
+    """Draw 500 ft height isolines and label every second contour (4C/FZL shared scheme)."""
+    contour_levels = np.arange(500, 18000, 500)
+    label_levels = contour_levels[1::2]
+    contour_set = ax.contour(
+        longitude,
+        latitude,
+        height_ft,
+        levels=contour_levels,
+        cmap=cmap,
+        linewidths=1.0,
+        alpha=0.5,
+        transform=ccrs.PlateCarree(),
+        zorder=50,
+    )
+    labels = ax.clabel(contour_set, levels=label_levels, inline=True, fontsize=9, fmt='%d ft')
+    style_height_contour_labels(contour_set, labels, cmap, norm)
+    return contour_set
 
 
 def publish_generated_frames(output_dir, generated_files, temp_dir):
@@ -492,14 +605,18 @@ def write_frame_manifest(base_dir=None):
     images_dir = os.path.join(base_dir, 'images')
     os.makedirs(images_dir, exist_ok=True)
 
+    georef_by_domain = calibrate_domain_georef()
     domains = {}
     for domain_id in normalize_domain_ids():
         domain_root = get_domain_root_relative_dir(domain_id)
         categories = build_categories_manifest(domain_root, base_dir)
+        georef = georef_by_domain.get(domain_id, {})
 
         domains[domain_id] = {
             'label': DOMAIN_DEFINITIONS[domain_id]['label'],
             'categories': categories,
+            'extent': georef.get('extent'),
+            'axesFraction': georef.get('axesFraction'),
         }
 
     manifest = {
@@ -1051,8 +1168,30 @@ def calculate_icing_relative_humidity(data):
 
 
 def calculate_marginal_icing_relative_humidity(data):
-    """Return mean RH (%) between the 0C and 4C isotherm layer."""
-    return calculate_layer_mean_relative_humidity(data, 0.0, 4.0)
+    """Return max of mean RH (%) in the 0C–4C and -5C–0C isotherm layers."""
+    rh_0_to_4c = calculate_layer_mean_relative_humidity(data, 0.0, 4.0)
+    rh_m5_to_0c = calculate_layer_mean_relative_humidity(data, -5.0, 0.0)
+    return np.fmax(rh_0_to_4c, rh_m5_to_0c)
+
+
+def clean_binary_mask(mask, min_cells=8, open_iterations=1):
+    """Remove tiny speckles from a boolean mask (opening + connected-component size filter)."""
+    cleaned = np.asarray(mask, dtype=bool)
+    if not cleaned.any():
+        return cleaned
+
+    if open_iterations > 0:
+        cleaned = ndimage.binary_opening(cleaned, iterations=int(open_iterations))
+
+    if min_cells > 1 and cleaned.any():
+        labeled, feature_count = ndimage.label(cleaned)
+        if feature_count:
+            counts = np.bincount(labeled.ravel())
+            keep = counts >= int(min_cells)
+            keep[0] = False
+            cleaned = keep[labeled]
+
+    return cleaned
 
 
 def calculate_estimated_snow_level_m(data):
@@ -2265,25 +2404,19 @@ def plot_map(data, init_time, forecast_hour, model_name='GFS', layer_profile='bg
             zorder=4.8,
         )
 
-        iso_contour_levels = np.arange(500, 18000, 500)
-        cs_iso = ax.contour(
-            data.longitude,
-            data.latitude,
-            isotherm_height_ft,
-            levels=iso_contour_levels,
-            cmap=iso_cmap,
-            linewidths=1.0,
-            alpha=0.5,
-            transform=ccrs.PlateCarree(),
-            zorder=50,
+        draw_height_isolines_with_labels(
+            ax, data.longitude, data.latitude, isotherm_height_ft, iso_cmap, iso_norm
         )
-        iso_labels = ax.clabel(cs_iso, inline=True, fontsize=7, fmt='%d ft')
-        for label in iso_labels:
-            label.set_zorder(50.1)
 
-        # Marginal icing: mean RH between 0C and 4C as hatched fill + dashed outline.
+        # Marginal icing: max of mean RH in 0–4C and -5–0C as hatched fill + dashed outline.
         marginal_icing_rh = calculate_marginal_icing_relative_humidity(data)
-        marginal_icing_mask = (np.isfinite(marginal_icing_rh) & (marginal_icing_rh >= 95.0)).astype(float)
+        marginal_icing_bool = np.isfinite(marginal_icing_rh) & (marginal_icing_rh >= 92.0)
+        # Drop single-grid speckles so only coherent risk areas remain.
+        marginal_icing_mask = clean_binary_mask(
+            marginal_icing_bool,
+            min_cells=8,
+            open_iterations=1,
+        ).astype(float)
         hatch_overlay = ax.contourf(
             data.longitude,
             data.latitude,
@@ -2304,7 +2437,7 @@ def plot_map(data, init_time, forecast_hour, model_name='GFS', layer_profile='bg
             data.latitude,
             marginal_icing_mask,
             levels=[0.5],
-            colors=[(0.0, 0.25, 0.45, 0.95)],
+            colors=[(0.0, 0.25, 0.45, 0.4)],
             linewidths=1.1,
             linestyles=[(0, (5, 3))],
             transform=ccrs.PlateCarree(),
@@ -2345,6 +2478,11 @@ def plot_map(data, init_time, forecast_hour, model_name='GFS', layer_profile='bg
             zorder=4.8,
         )
 
+        # Same isoline/label scheme as the 4C isotherm height map.
+        draw_height_isolines_with_labels(
+            ax, data.longitude, data.latitude, freezing_level_ft, fzl_cmap, fzl_norm
+        )
+
         # Diagonal cross-hatching where a freezing layer exists
         # (multiple 0C crossings in the vertical column).
         freezing_layer_mask = calculate_freezing_layer_mask(data).astype(float)
@@ -2360,23 +2498,6 @@ def plot_map(data, init_time, forecast_hour, model_name='GFS', layer_profile='bg
         )
         hatch_overlay.set_facecolors([(0.0, 0.0, 0.0, 0.0)])
         hatch_overlay.set_edgecolors([(0.0, 0.0, 0.0, 0.5)])
-
-        # Draw freezing-level isolines every 500 ft.
-        fzl_contour_levels = np.arange(500, 18000, 500)
-        cs_fzl = ax.contour(
-            data.longitude,
-            data.latitude,
-            freezing_level_ft,
-            levels=fzl_contour_levels,
-            cmap=fzl_cmap,
-            linewidths=1.0,
-            alpha=0.5,
-            transform=ccrs.PlateCarree(),
-            zorder=50,
-        )
-        fzl_labels = ax.clabel(cs_fzl, inline=True, fontsize=7, fmt='%d ft')
-        for label in fzl_labels:
-            label.set_zorder(50.1)
 
         # Icing layer: mean RH between 0C and -15C, using provided XML color bins.
         icing_rh = calculate_icing_relative_humidity(data)
