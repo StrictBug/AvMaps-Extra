@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AvMaps Extra</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body class="loading">
+    <header>
+        <div class="title-section">
+            <h1>AvMaps Extra</h1>
+            <button id="info-btn" class="info-btn" type="button" aria-label="Show keyboard controls" title="Keyboard controls">i</button>
+        </div>
+        <div class="domain-section">
+            <div class="domain-buttons">
+                <button class="domain-btn active" data-domain="AU" type="button">Australia</button>
+                <button class="domain-btn" data-domain="WA_SA" type="button">WA / SA</button>
+                <button class="domain-btn" data-domain="VIC_TAS" type="button">VIC / TAS</button>
+                <button class="domain-btn" data-domain="NSW" type="button">NSW</button>
+            </div>
+            <div class="mobile-selectors">
+                <select id="mobile-domain-select" class="mobile-select" aria-label="Select domain">
+                    <option value="AU">Australia</option>
+                    <option value="WA_SA">WA / SA</option>
+                    <option value="VIC_TAS">VIC / TAS</option>
+                    <option value="NSW">NSW</option>
+                </select>
+            </div>
+        </div>
+    </header>
+
+    <main class="main-content">
+        <div class="image-container">
+            <div class="image-pair">
+                <div class="image-panel left-panel">
+                    <img id="left-image" src="" alt="Freezing level">
+                </div>
+                <div class="image-panel right-panel">
+                    <img id="right-image" src="" alt="4C isotherm height">
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <div class="loading-overlay" id="loading-overlay" aria-live="polite">
+        <div class="loading-card">
+            <p class="loading-title">Loading maps</p>
+            <div class="loading-bar-track">
+                <div class="loading-bar-fill" id="loading-bar-fill"></div>
+            </div>
+            <p class="loading-status" id="loading-status">Preparing frames...</p>
+        </div>
+    </div>
+
+    <div class="info-overlay hidden" id="info-overlay" aria-hidden="true">
+        <div class="info-card" role="dialog" aria-modal="true" aria-labelledby="info-title">
+            <button id="info-close-btn" class="info-close-btn" type="button" aria-label="Close information">×</button>
+            <h2 id="info-title" class="info-title">Keyboard Controls</h2>
+
+            <div class="info-section">
+                <h3>Switch Domain</h3>
+                <p><span class="key-chip">1</span> Australia - South</p>
+                <p><span class="key-chip">2</span> WA/SA</p>
+                <p><span class="key-chip">3</span> VIC/TAS</p>
+                <p><span class="key-chip">4</span> NSW</p>
+            </div>
+
+            <div class="info-section">
+                <h3>Playback</h3>
+                <p><span class="key-chip">Space</span> Play/Pause</p>
+                <p><span class="key-chip">←</span> Previous frame</p>
+                <p><span class="key-chip">→</span> Next frame</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+            <div class="legend-strip" id="legend-strip" aria-live="polite">
+                <div class="legend-header">
+                    <div class="legend-actions">
+                        <button id="legend-toggle-btn" class="legend-action-btn" type="button" aria-label="Toggle legend visibility">Hide legend</button>
+                    </div>
+                </div>
+                <div class="legend-content" id="legend-content"></div>
+            </div>
+
+            <div class="range-time-display" id="range-time-display" aria-live="polite">
+                <div class="current-time-row">
+                    <div class="current-time-item"><strong id="current-frame-time">--</strong></div>
+                    <div class="timezone-selector">
+                        <select id="timezone-select" aria-label="Select timezone">
+                            <option value="UTC" selected>UTC (UTC+0:00)</option>
+                            <option value="AWST">AWST (UTC+8:00)</option>
+                            <option value="ACST">ACST (UTC+9:30)</option>
+                            <option value="AEST">AEST (UTC+10:00)</option>
+                            <option value="ACDT">ACDT (UTC+10:30)</option>
+                            <option value="AEDT">AEDT (UTC+11:00)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="range-time-row">
+                    <span class="range-time-item range-time-item-start"><strong id="range-start-time">--</strong></span>
+                    <div class="slider-container">
+                        <div class="frame-slider-shell" id="frame-slider-shell">
+                            <div class="frame-slider-base" aria-hidden="true"></div>
+                            <div class="frame-selection-highlight" id="frame-selection-highlight" aria-hidden="true"></div>
+                            <input type="range" id="frame-range-start" class="frame-bound-slider" min="1" max="40" value="1" step="1" aria-label="Start frame">
+                            <input type="range" id="frame-range-end" class="frame-bound-slider" min="1" max="40" value="40" step="1" aria-label="End frame">
+                            <input type="range" id="frame-slider" class="frame-slider" min="1" max="40" value="1" step="1">
+                        </div>
+                    </div>
+                    <span class="range-time-item range-time-item-end"><strong id="range-end-time">--</strong></span>
+                </div>
+            </div>
+
+            <div class="playback-controls">
+                <button id="play-btn" class="control-btn">▶ Play</button>
+                <div class="speed-control">
+                    <label for="speed-slider"></label>
+                    <input type="range" id="speed-slider" min="100" max="1000" value="500" step="100">
+                    <span id="speed-display">500ms</span>
+                </div>
+            </div>
+        </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

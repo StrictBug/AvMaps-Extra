@@ -1,0 +1,13 @@
+cartopy
+cfgrib
+eccodes==2.48.0
+eccodeslib==2.48.2.27
+eckitlib==2.2.0.27
+matplotlib
+numpy
+pandas
+requests
+scipy
+shapely
+siphon
+xarray
