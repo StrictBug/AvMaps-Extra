@@ -4,7 +4,9 @@
     ];
 
     const profileCache = new Map();
+    const hourlyCache = new Map();
     const MAX_CACHE_ENTRIES = 24;
+    const MAX_HOURLY_CACHE_ENTRIES = 8;
 
     const PANEL_SIZE_STORAGE_KEY = 'avmapsExtra.soundingPanelSizePx';
     const MIN_PANEL_PX = 240;
@@ -27,6 +29,10 @@
     let panelOpen = false;
     let lastProfile = null;
     let lastPlot = null;
+    let lastValidTimeIso = null;
+    // Fixed T/P axes for the current pin so playback doesn't rescale every hour.
+    let lockedAxes = null;
+    let loadGeneration = 0;
     let storedPanelSizePx = null;
     let resizeRaf = 0;
     let activePointerId = null;
@@ -250,8 +256,12 @@
     }
 
     function cacheKey(lat, lon, validTimeIso) {
-        // v2: filter below-ground isobaric levels to avoid near-surface artefacts.
-        return `v2:${lat.toFixed(3)},${lon.toFixed(3)},${validTimeIso}`;
+        // v4: plot non-null dewpoints; axis includes Td; RH fallback; POST fetch.
+        return `v4:${lat.toFixed(3)},${lon.toFixed(3)},${validTimeIso}`;
+    }
+
+    function hourlyCacheKey(lat, lon, dateText) {
+        return `${lat.toFixed(3)},${lon.toFixed(3)},${dateText}`;
     }
 
     function rememberProfile(key, profile) {
@@ -262,16 +272,45 @@
         }
     }
 
+    function rememberHourly(key, hourly, model) {
+        hourlyCache.set(key, { hourly, model });
+        if (hourlyCache.size > MAX_HOURLY_CACHE_ENTRIES) {
+            const oldest = hourlyCache.keys().next().value;
+            hourlyCache.delete(oldest);
+        }
+    }
+
     function buildHourlyVariableList() {
-        const vars = ['temperature_2m', 'dew_point_2m', 'surface_pressure'];
+        const vars = ['temperature_2m', 'dew_point_2m', 'relative_humidity_2m', 'surface_pressure'];
         PRESSURE_LEVELS_HPA.forEach((level) => {
             vars.push(`temperature_${level}hPa`);
             vars.push(`dew_point_${level}hPa`);
+            vars.push(`relative_humidity_${level}hPa`);
             vars.push(`wind_speed_${level}hPa`);
             vars.push(`wind_direction_${level}hPa`);
             vars.push(`geopotential_height_${level}hPa`);
         });
         return vars.join(',');
+    }
+
+    function dewpointFromTempRh(tempC, rhPercent) {
+        // Magnus-Tetens; used when Open-Meteo omits dew_point but provides RH.
+        if (!Number.isFinite(tempC) || !Number.isFinite(rhPercent) || rhPercent <= 0) {
+            return null;
+        }
+        const rh = Math.min(100, rhPercent);
+        const gamma = Math.log(rh / 100) + (17.67 * tempC) / (tempC + 243.5);
+        const dewpoint = (243.5 * gamma) / (17.67 - gamma);
+        return Number.isFinite(dewpoint) ? dewpoint : null;
+    }
+
+    function resolveDewpoint(hourly, hourIndex, pressure, temperature) {
+        const direct = hourly[`dew_point_${pressure}hPa`]?.[hourIndex];
+        if (Number.isFinite(direct)) {
+            return direct;
+        }
+        const rh = hourly[`relative_humidity_${pressure}hPa`]?.[hourIndex];
+        return dewpointFromTempRh(temperature, rh);
     }
 
     function nearestHourIndex(times, targetDate) {
@@ -303,27 +342,7 @@
         return new Date(text);
     }
 
-    async function fetchOpenMeteoProfile(lat, lon, validTime) {
-        const startDate = validTime.toISOString().slice(0, 10);
-        const params = new URLSearchParams({
-            latitude: lat.toFixed(4),
-            longitude: lon.toFixed(4),
-            hourly: buildHourlyVariableList(),
-            models: 'gfs_seamless',
-            wind_speed_unit: 'kn',
-            timezone: 'UTC',
-            start_date: startDate,
-            end_date: startDate,
-        });
-
-        const url = `https://api.open-meteo.com/v1/forecast?${params.toString()}`;
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`Open-Meteo request failed (${response.status})`);
-        }
-
-        const payload = await response.json();
-        const hourly = payload.hourly;
+    function buildProfileFromHourly(hourly, model, lat, lon, validTime) {
         if (!hourly?.time?.length) {
             throw new Error('No hourly profile data returned');
         }
@@ -333,14 +352,14 @@
 
         PRESSURE_LEVELS_HPA.forEach((pressure) => {
             const temperature = hourly[`temperature_${pressure}hPa`]?.[hourIndex];
-            const dewpoint = hourly[`dew_point_${pressure}hPa`]?.[hourIndex];
-            if (!Number.isFinite(temperature) || !Number.isFinite(dewpoint)) {
+            // Keep levels with temperature even when dewpoint is missing (common aloft).
+            if (!Number.isFinite(temperature)) {
                 return;
             }
             levels.push({
                 pressure,
                 temperature,
-                dewpoint,
+                dewpoint: resolveDewpoint(hourly, hourIndex, pressure, temperature),
                 height: hourly[`geopotential_height_${pressure}hPa`]?.[hourIndex] ?? null,
                 windSpeedKt: hourly[`wind_speed_${pressure}hPa`]?.[hourIndex] ?? null,
                 windDirDeg: hourly[`wind_direction_${pressure}hPa`]?.[hourIndex] ?? null,
@@ -349,14 +368,17 @@
 
         const surfacePressure = hourly.surface_pressure?.[hourIndex];
         const surfaceTemp = hourly.temperature_2m?.[hourIndex];
-        const surfaceDew = hourly.dew_point_2m?.[hourIndex];
-        if (Number.isFinite(surfacePressure) && Number.isFinite(surfaceTemp) && Number.isFinite(surfaceDew)) {
+        let surfaceDew = hourly.dew_point_2m?.[hourIndex];
+        if (!Number.isFinite(surfaceDew)) {
+            surfaceDew = dewpointFromTempRh(surfaceTemp, hourly.relative_humidity_2m?.[hourIndex]);
+        }
+        if (Number.isFinite(surfacePressure) && Number.isFinite(surfaceTemp)) {
             // Drop isobaric points at/below ground — they cause near-surface zig-zags.
             const aboveGround = levels.filter((level) => level.pressure < surfacePressure - 0.5);
             aboveGround.push({
                 pressure: surfacePressure,
                 temperature: surfaceTemp,
-                dewpoint: surfaceDew,
+                dewpoint: Number.isFinite(surfaceDew) ? surfaceDew : null,
                 height: 0,
                 windSpeedKt: null,
                 windDirDeg: null,
@@ -370,13 +392,212 @@
 
         return {
             source: 'Open-Meteo GFS',
-            model: payload.model || 'gfs_seamless',
+            model: model || 'gfs_seamless',
             validTime: parseUtcHour(hourly.time[hourIndex]),
             latitude: lat,
             longitude: lon,
             levels,
             surfacePressure: Number.isFinite(surfacePressure) ? surfacePressure : null,
         };
+    }
+
+    async function fetchOpenMeteoHourly(lat, lon, validTime) {
+        const startDate = validTime.toISOString().slice(0, 10);
+        const dayKey = hourlyCacheKey(lat, lon, startDate);
+        const cached = hourlyCache.get(dayKey);
+        if (cached?.hourly?.time?.length) {
+            return cached;
+        }
+
+        // POST avoids long GET URLs dropping trailing humidity variables in some browsers.
+        const body = new URLSearchParams({
+            latitude: lat.toFixed(4),
+            longitude: lon.toFixed(4),
+            hourly: buildHourlyVariableList(),
+            models: 'gfs_seamless',
+            wind_speed_unit: 'kn',
+            timezone: 'UTC',
+            start_date: startDate,
+            end_date: startDate,
+        });
+
+        const response = await fetch('https://api.open-meteo.com/v1/forecast', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body,
+        });
+        if (!response.ok) {
+            throw new Error(`Open-Meteo request failed (${response.status})`);
+        }
+
+        const payload = await response.json();
+        const hourly = payload.hourly;
+        if (!hourly?.time?.length) {
+            throw new Error('No hourly profile data returned');
+        }
+
+        const entry = { hourly, model: payload.model || 'gfs_seamless' };
+        rememberHourly(dayKey, entry.hourly, entry.model);
+        return entry;
+    }
+
+    async function fetchOpenMeteoProfile(lat, lon, validTime) {
+        const { hourly, model } = await fetchOpenMeteoHourly(lat, lon, validTime);
+        return buildProfileFromHourly(hourly, model, lat, lon, validTime);
+    }
+
+    // Thermodynamic constants for adiabat background curves (SI + hPa).
+    const RD = 287.05;       // J kg-1 K-1, dry air
+    const CP = 1005.7;       // J kg-1 K-1
+    const KAPPA = RD / CP;   // ≈ 0.2854
+    const LV = 2.501e6;      // J kg-1, latent heat of vaporization
+    const EPS = 0.622;       // Rd / Rv
+    const P_REF_HPA = 1000;
+
+    function dryAdiabatTempC(thetaC, pressureHpa) {
+        // θ labeled in °C at 1000 hPa: T = θ_K * (p/1000)^κ
+        const thetaK = thetaC + 273.15;
+        return thetaK * Math.pow(Math.max(pressureHpa, 1) / P_REF_HPA, KAPPA) - 273.15;
+    }
+
+    function saturationVaporPressureHpa(tempC) {
+        // Bolton (1980) over liquid water.
+        return 6.112 * Math.exp((17.67 * tempC) / (tempC + 243.5));
+    }
+
+    function saturationMixingRatio(tempC, pressureHpa) {
+        const es = saturationVaporPressureHpa(tempC);
+        return (EPS * es) / Math.max(pressureHpa - es, 0.1);
+    }
+
+    function moistAdiabatDTdP(tempK, pressureHpa) {
+        // Pseudoadiabatic dT/dp (K / hPa).
+        const tempC = tempK - 273.15;
+        const ws = saturationMixingRatio(tempC, pressureHpa);
+        const numerator = RD * tempK + LV * ws;
+        const denominator = pressureHpa * (CP + (LV * LV * ws * EPS) / (RD * tempK * tempK));
+        return numerator / Math.max(denominator, 1e-12);
+    }
+
+    function integrateMoistAdiabat(startTempC, pStart, pEnd, stepHpa = 5) {
+        // Integrate a saturated parcel from pStart toward pEnd.
+        const points = [{ temperature: startTempC, pressure: pStart }];
+        let tempK = startTempC + 273.15;
+        let pressure = pStart;
+        const direction = pEnd < pStart ? -1 : 1;
+        const absStep = Math.abs(stepHpa);
+
+        while ((direction < 0 && pressure > pEnd + 1e-6) || (direction > 0 && pressure < pEnd - 1e-6)) {
+            const nextP = direction < 0
+                ? Math.max(pEnd, pressure - absStep)
+                : Math.min(pEnd, pressure + absStep);
+            const substeps = 4;
+            const dP = (nextP - pressure) / substeps;
+            for (let s = 0; s < substeps; s += 1) {
+                const midP = pressure + dP * 0.5;
+                const dTdP = moistAdiabatDTdP(tempK, Math.max(midP, 1));
+                tempK += dTdP * dP;
+                pressure += dP;
+            }
+            pressure = nextP;
+            points.push({ temperature: tempK - 273.15, pressure });
+            if (!Number.isFinite(tempK) || tempK < 160 || tempK > 340) break;
+        }
+        return points;
+    }
+
+    function buildMoistAdiabatCurve(tempAt1000C, pBottom, pTop, stepHpa = 5) {
+        // Anchor each saturated adiabat at 1000 hPa, then fill the plot pressure range.
+        const up = integrateMoistAdiabat(tempAt1000C, P_REF_HPA, pTop, stepHpa);
+        if (pBottom <= P_REF_HPA) {
+            return up;
+        }
+        const down = integrateMoistAdiabat(tempAt1000C, P_REF_HPA, pBottom, stepHpa);
+        return down.slice(1).reverse().concat(up);
+    }
+
+    function strokeThermoCurve(ctx, points, plot) {
+        // Draw the full curve; the background clip rect trims to the plot.
+        // Skipping "outside" points left large empty regions for adiabats.
+        ctx.beginPath();
+        let started = false;
+        points.forEach((point) => {
+            if (!Number.isFinite(point.temperature) || !Number.isFinite(point.pressure)) {
+                started = false;
+                return;
+            }
+            if (point.pressure < plot.pMin - 30 || point.pressure > plot.pMax + 30) {
+                started = false;
+                return;
+            }
+            const x = skewX(point.temperature, point.pressure, plot);
+            const y = yFromPressure(point.pressure, plot);
+            if (!started) {
+                ctx.moveTo(x, y);
+                started = true;
+            } else {
+                ctx.lineTo(x, y);
+            }
+        });
+        if (started) ctx.stroke();
+    }
+
+    function dryAdiabatThetaRange(plot) {
+        // Choose θ so dry adiabats cross the full visible T/p domain.
+        const samples = [
+            { t: plot.tMin - 20, p: plot.pMax },
+            { t: plot.tMax + 20, p: plot.pMax },
+            { t: plot.tMin - 40, p: plot.pMin },
+            { t: plot.tMax + 40, p: plot.pMin },
+            { t: plot.tMin - 30, p: (plot.pMin + plot.pMax) / 2 },
+            { t: plot.tMax + 30, p: (plot.pMin + plot.pMax) / 2 },
+        ];
+        let thetaMin = Infinity;
+        let thetaMax = -Infinity;
+        samples.forEach(({ t, p }) => {
+            const thetaC = (t + 273.15) * Math.pow(P_REF_HPA / Math.max(p, 1), KAPPA) - 273.15;
+            thetaMin = Math.min(thetaMin, thetaC);
+            thetaMax = Math.max(thetaMax, thetaC);
+        });
+        return {
+            start: Math.floor(thetaMin / 10) * 10,
+            end: Math.ceil(thetaMax / 10) * 10,
+        };
+    }
+
+    function drawDryAdiabats(ctx, plot) {
+        // Potential temperature (°C at 1000 hPa), every 10°.
+        const pStep = 5;
+        const { start, end } = dryAdiabatThetaRange(plot);
+        ctx.strokeStyle = 'rgba(150, 105, 55, 0.45)';
+        ctx.lineWidth = 0.95;
+        ctx.setLineDash([]);
+
+        for (let thetaC = start; thetaC <= end; thetaC += 10) {
+            const points = [];
+            for (let p = plot.pMax; p >= plot.pMin; p -= pStep) {
+                points.push({ temperature: dryAdiabatTempC(thetaC, p), pressure: p });
+            }
+            strokeThermoCurve(ctx, points, plot);
+        }
+    }
+
+    function drawSaturatedAdiabats(ctx, plot) {
+        // Pseudoadiabats characterized by temperature at 1000 hPa.
+        const pBottom = Math.max(plot.pMax, P_REF_HPA);
+        const pTop = Math.max(plot.pMin, 100);
+        // Cover cold left through warm right of a typical AU sounding pane.
+        const startTemp = Math.min(-40, Math.floor((plot.tMin - 10) / 5) * 5);
+        const endTemp = Math.max(40, Math.ceil((plot.tMax + 10) / 5) * 5);
+        ctx.strokeStyle = 'rgba(35, 130, 110, 0.48)';
+        ctx.lineWidth = 0.9;
+        ctx.setLineDash([4, 3]);
+
+        for (let tempAt1000C = startTemp; tempAt1000C <= endTemp; tempAt1000C += 5) {
+            const points = buildMoistAdiabatCurve(tempAt1000C, pBottom, pTop, 5);
+            strokeThermoCurve(ctx, points, plot);
+        }
+        ctx.setLineDash([]);
     }
 
     // Skew-T geometry: isotherms at ~45° (Windy-like), temperature axis auto-fit to profile.
@@ -530,8 +751,23 @@
         return { pMin: 150, pMax };
     }
 
+    function choosePressureRangeFromHourly(hourly) {
+        let maxSurface = null;
+        (hourly?.surface_pressure || []).forEach((pressure) => {
+            if (!Number.isFinite(pressure)) return;
+            maxSurface = maxSurface == null ? pressure : Math.max(maxSurface, pressure);
+        });
+        if (maxSurface == null) {
+            return { pMin: 150, pMax: 1050 };
+        }
+        return {
+            pMin: 150,
+            pMax: Math.min(1050, Math.max(1000, Math.ceil(maxSurface / 10) * 10 + 10)),
+        };
+    }
+
     function collectTemperatureSamples(levels, pMin, pMax) {
-        // Fit the axis to temperature only (Windy-like). Dewpoint may clip on the left.
+        // Include non-null dewpoints so the blue trace stays on-canvas.
         const samples = [];
         levels.forEach((level) => {
             if (!Number.isFinite(level.pressure)) return;
@@ -539,8 +775,114 @@
             if (Number.isFinite(level.temperature)) {
                 samples.push({ temperature: level.temperature, pressure: level.pressure });
             }
+            if (Number.isFinite(level.dewpoint)) {
+                samples.push({ temperature: level.dewpoint, pressure: level.pressure });
+            }
         });
         return samples;
+    }
+
+    function collectTemperatureSamplesFromHourly(hourly, pMin, pMax) {
+        const samples = [];
+        const times = hourly?.time || [];
+        for (let hourIndex = 0; hourIndex < times.length; hourIndex += 1) {
+            PRESSURE_LEVELS_HPA.forEach((pressure) => {
+                if (pressure < pMin || pressure > pMax) return;
+                const temperature = hourly[`temperature_${pressure}hPa`]?.[hourIndex];
+                if (Number.isFinite(temperature)) {
+                    samples.push({ temperature, pressure });
+                }
+                const dewpoint = resolveDewpoint(hourly, hourIndex, pressure, temperature);
+                if (Number.isFinite(dewpoint)) {
+                    samples.push({ temperature: dewpoint, pressure });
+                }
+            });
+            const surfacePressure = hourly.surface_pressure?.[hourIndex];
+            const surfaceTemp = hourly.temperature_2m?.[hourIndex];
+            if (
+                Number.isFinite(surfacePressure)
+                && Number.isFinite(surfaceTemp)
+                && surfacePressure >= pMin - 1
+                && surfacePressure <= pMax + 1
+            ) {
+                samples.push({ temperature: surfaceTemp, pressure: surfacePressure });
+                let surfaceDew = hourly.dew_point_2m?.[hourIndex];
+                if (!Number.isFinite(surfaceDew)) {
+                    surfaceDew = dewpointFromTempRh(surfaceTemp, hourly.relative_humidity_2m?.[hourIndex]);
+                }
+                if (Number.isFinite(surfaceDew)) {
+                    samples.push({ temperature: surfaceDew, pressure: surfacePressure });
+                }
+            }
+        }
+        return samples;
+    }
+
+    function buildPlotSkeleton(width, height, pMin, pMax) {
+        const padL = 32;
+        const padR = 40;
+        const padT = 8;
+        const padB = 22;
+        const plot = {
+            width,
+            height,
+            padL,
+            padR,
+            padT,
+            padB,
+            pMin,
+            pMax,
+            innerW: Math.max(40, width - padL - padR),
+            innerH: Math.max(40, height - padT - padB),
+        };
+        plot.logPMin = Math.log(plot.pMin);
+        plot.logPMax = Math.log(plot.pMax);
+        const logSpan = Math.max(plot.logPMax - plot.logPMin, 1e-6);
+        plot.skewFactor = Math.min(plot.innerH * 0.92, plot.innerW * 0.92) / logSpan;
+        return plot;
+    }
+
+    function computeAxesFromHourly(hourly, width, height) {
+        const pressure = choosePressureRangeFromHourly(hourly);
+        const plot = buildPlotSkeleton(width, height, pressure.pMin, pressure.pMax);
+        const samples = collectTemperatureSamplesFromHourly(hourly, pressure.pMin, pressure.pMax);
+        const temps = chooseTemperatureRange(samples, plot);
+        return {
+            pMin: pressure.pMin,
+            pMax: pressure.pMax,
+            tMin: temps.tMin,
+            tMax: temps.tMax,
+        };
+    }
+
+    function mergeLockedAxes(base, next) {
+        if (!base) return { ...next };
+        return {
+            pMin: Math.min(base.pMin, next.pMin),
+            pMax: Math.max(base.pMax, next.pMax),
+            tMin: Math.min(base.tMin, next.tMin),
+            tMax: Math.max(base.tMax, next.tMax),
+        };
+    }
+
+    function pinMatchesLockedAxes(lat, lon) {
+        if (!lockedAxes) return false;
+        return (
+            Math.abs(lockedAxes.lat - lat) < 1e-4
+            && Math.abs(lockedAxes.lon - lon) < 1e-4
+        );
+    }
+
+    function updateLockedAxesFromHourly(hourly, lat, lon) {
+        const width = canvasEl?.clientWidth || 640;
+        const height = canvasEl?.clientHeight || 520;
+        const dayAxes = computeAxesFromHourly(hourly, width, height);
+        if (!pinMatchesLockedAxes(lat, lon)) {
+            lockedAxes = { ...dayAxes, lat, lon };
+            return lockedAxes;
+        }
+        lockedAxes = { ...mergeLockedAxes(lockedAxes, dayAxes), lat, lon };
+        return lockedAxes;
     }
 
     function chooseTemperatureRange(samples, plot) {
@@ -552,8 +894,10 @@
         const marginRightPx = 12;
         const rawMin = Math.min(...samples.map((s) => s.temperature));
         const rawMax = Math.max(...samples.map((s) => s.temperature));
-        // Tight span: skew already shifts cold upper air right, so avoid a huge empty cold flank.
+        // Fit T+Td, but cap span so extremely dry upper Td does not empty the pane.
+        const maxSpan = 70;
         let span = Math.max(40, Math.ceil((rawMax - rawMin + 6) / 5) * 5);
+        span = Math.min(span, maxSpan);
 
         const tryFit = (tempSpan) => {
             let tMinLow = -Infinity;
@@ -574,7 +918,7 @@
                 return null;
             }
 
-            // Prefer a higher tMin (less empty negative axis) while keeping surface in the right half.
+            // Prefer a higher tMin (less empty cold flank) while keeping surface in the right half.
             const surface = samples.reduce((best, sample) => (
                 !best || sample.pressure > best.pressure ? sample : best
             ), null);
@@ -591,37 +935,31 @@
         for (let i = 0; i < 14; i += 1) {
             const fitted = tryFit(span);
             if (fitted) return fitted;
-            span += 5;
+            if (span >= maxSpan) break;
+            span = Math.min(maxSpan, span + 5);
         }
 
-        const fallbackMin = Math.floor((rawMin - 2) / 5) * 5;
-        return { tMin: fallbackMin, tMax: fallbackMin + span };
+        // Capped span cannot cover every ultra-dry Td — keep the warm end and extend left.
+        const fallbackMin = Math.floor((rawMax - maxSpan + 2) / 5) * 5;
+        return { tMin: fallbackMin, tMax: fallbackMin + maxSpan };
     }
 
-    function buildPlotLayout(width, height, levels) {
-        const padL = 32;
-        const padR = 40;
-        const padT = 8;
-        const padB = 22;
-        const pressure = choosePressureRange(levels);
-        const plot = {
-            width,
-            height,
-            padL,
-            padR,
-            padT,
-            padB,
-            pMin: pressure.pMin,
-            pMax: pressure.pMax,
-            innerW: Math.max(40, width - padL - padR),
-            innerH: Math.max(40, height - padT - padB),
-        };
-        plot.logPMin = Math.log(plot.pMin);
-        plot.logPMax = Math.log(plot.pMax);
-        const logSpan = Math.max(plot.logPMax - plot.logPMin, 1e-6);
-        // Strong diagonal isotherms: cross most of the plot width over the full height.
-        const targetSkewPx = Math.min(plot.innerH * 0.92, plot.innerW * 0.92);
-        plot.skewFactor = targetSkewPx / logSpan;
+    function buildPlotLayout(width, height, levels, axesLock = null) {
+        const pressure = axesLock
+            ? { pMin: axesLock.pMin, pMax: axesLock.pMax }
+            : choosePressureRange(levels);
+        const plot = buildPlotSkeleton(width, height, pressure.pMin, pressure.pMax);
+
+        if (
+            axesLock
+            && Number.isFinite(axesLock.tMin)
+            && Number.isFinite(axesLock.tMax)
+            && axesLock.tMax > axesLock.tMin
+        ) {
+            plot.tMin = axesLock.tMin;
+            plot.tMax = axesLock.tMax;
+            return plot;
+        }
 
         const temps = chooseTemperatureRange(
             collectTemperatureSamples(levels, plot.pMin, plot.pMax),
@@ -661,9 +999,14 @@
             ctx.stroke();
         }
 
+        // Dry (solid brown) then saturated (dashed teal) adiabats under the isobars.
+        drawDryAdiabats(ctx, plot);
+        drawSaturatedAdiabats(ctx, plot);
+
         const pressureTicks = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150];
         ctx.strokeStyle = 'rgba(120, 140, 165, 0.55)';
         ctx.lineWidth = 1;
+        ctx.setLineDash([]);
         pressureTicks.forEach((p) => {
             if (p < plot.pMin || p > plot.pMax) return;
             const y = yFromPressure(p, plot);
@@ -712,34 +1055,44 @@
         ctx.clip();
 
         ctx.strokeStyle = color;
-        ctx.lineWidth = 2.6;
+        ctx.lineWidth = key === 'dewpoint' ? 2.2 : 2.6;
         ctx.lineJoin = 'round';
         ctx.lineCap = 'round';
-        ctx.beginPath();
+
+        // Stroke each contiguous run of finite values so nulls only open gaps.
         let started = false;
-        let prevInside = false;
+        const flush = () => {
+            if (!started) return;
+            ctx.stroke();
+            ctx.beginPath();
+            started = false;
+        };
+
+        ctx.beginPath();
         levels.forEach((level) => {
             const value = level[key];
-            if (!Number.isFinite(value) || !Number.isFinite(level.pressure)) return;
-            if (level.pressure < plot.pMin - 1 || level.pressure > plot.pMax + 2) return;
-            const x = skewX(value, level.pressure, plot);
-            const y = yFromPressure(level.pressure, plot);
-            const inside = pointInPlot(x, y, plot, 24);
-            if (!inside) {
-                // Break the path so clipped exterior segments don't draw edge artefacts.
-                started = false;
-                prevInside = false;
+            if (!Number.isFinite(value) || !Number.isFinite(level.pressure)) {
+                flush();
                 return;
             }
-            if (!started || !prevInside) {
+            if (level.pressure < plot.pMin - 1 || level.pressure > plot.pMax + 2) {
+                flush();
+                return;
+            }
+            const x = skewX(value, level.pressure, plot);
+            const y = yFromPressure(level.pressure, plot);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) {
+                flush();
+                return;
+            }
+            if (!started) {
                 ctx.moveTo(x, y);
                 started = true;
             } else {
                 ctx.lineTo(x, y);
             }
-            prevInside = true;
         });
-        if (started) ctx.stroke();
+        flush();
         ctx.restore();
     }
 
@@ -824,7 +1177,10 @@
         const ctx = canvasEl.getContext('2d');
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-        const plot = buildPlotLayout(width, height, profile.levels);
+        const axesLock = pinMatchesLockedAxes(profile.latitude, profile.longitude)
+            ? lockedAxes
+            : null;
+        const plot = buildPlotLayout(width, height, profile.levels, axesLock);
         lastPlot = plot;
         // Default SH for this AU-focused viewer; follow profile latitude when available.
         const southernHemisphere = !(Number.isFinite(profile.latitude) && profile.latitude > 0);
@@ -905,12 +1261,76 @@
         return `${Math.abs(lat).toFixed(2)}°${latHem}, ${Math.abs(lon).toFixed(2)}°${lonHem}`;
     }
 
+    async function loadProfileForPin(validTime, { showLoading = true } = {}) {
+        ensureUi();
+        if (!panelOpen || !Number.isFinite(pinLat) || !Number.isFinite(pinLon)) {
+            return;
+        }
+        if (!(validTime instanceof Date) || Number.isNaN(validTime.getTime())) {
+            return;
+        }
+
+        const validTimeIso = validTime.toISOString();
+        if (validTimeIso === lastValidTimeIso && lastProfile) {
+            return;
+        }
+
+        const generation = ++loadGeneration;
+        lastValidTimeIso = validTimeIso;
+
+        if (showLoading) {
+            metaEl.textContent = `${formatLatLon(pinLat, pinLon)} · fetching GFS profile…`;
+            statusEl.textContent = 'Loading sounding…';
+            statusEl.classList.remove('error');
+        }
+
+        const key = cacheKey(pinLat, pinLon, validTimeIso);
+        try {
+            const { hourly, model } = await fetchOpenMeteoHourly(pinLat, pinLon, validTime);
+            let profile = profileCache.get(key);
+            if (!profile) {
+                profile = buildProfileFromHourly(hourly, model, pinLat, pinLon, validTime);
+                rememberProfile(key, profile);
+            }
+
+            // A newer timestep request superseded this one while we were waiting.
+            if (generation !== loadGeneration) {
+                return;
+            }
+
+            // Lock / expand axes from the full day at this pin so animation stays stable.
+            updateLockedAxesFromHourly(hourly, pinLat, pinLon);
+
+            metaEl.textContent = (
+                `${formatLatLon(pinLat, pinLon)} · Valid ${profile.validTime.toISOString().replace('.000Z', 'Z')} · `
+                + `${profile.source}`
+            );
+            statusEl.textContent = '';
+            statusEl.classList.remove('error');
+            renderSkewT(profile);
+        } catch (error) {
+            if (generation !== loadGeneration) {
+                return;
+            }
+            console.warn('Sounding fetch failed:', error);
+            lastProfile = null;
+            statusEl.textContent = error?.message || 'Unable to load sounding';
+            statusEl.classList.add('error');
+            const ctx = canvasEl?.getContext('2d');
+            if (ctx && canvasEl) {
+                ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+            }
+        }
+    }
+
     async function openAt({ lat, lon, validTime, mapImg, offsetX, offsetY }) {
         ensureUi();
         if (!panelEl || !toolEnabled) return;
 
         pinLat = lat;
         pinLon = lon;
+        lastValidTimeIso = null;
+        lockedAxes = null;
 
         panelEl.classList.remove('hidden');
         panelEl.setAttribute('aria-hidden', 'false');
@@ -923,45 +1343,27 @@
         applyPanelSize(storedPanelSizePx, { persist: false, notify: false });
         syncPin();
 
-        metaEl.textContent = `${formatLatLon(lat, lon)} · fetching GFS profile…`;
-        statusEl.textContent = 'Loading sounding…';
-        statusEl.classList.remove('error');
-
         // Allow layout to settle before measuring canvas size / final pin position.
         requestAnimationFrame(() => {
             scheduleLayoutNotify();
         });
 
-        const key = cacheKey(lat, lon, validTime.toISOString());
-        try {
-            let profile = profileCache.get(key);
-            if (!profile) {
-                profile = await fetchOpenMeteoProfile(lat, lon, validTime);
-                rememberProfile(key, profile);
-            }
+        await loadProfileForPin(validTime, { showLoading: true });
+    }
 
-            metaEl.textContent = (
-                `${formatLatLon(lat, lon)} · Valid ${profile.validTime.toISOString().replace('.000Z', 'Z')} · `
-                + `${profile.source}`
-            );
-            statusEl.textContent = '';
-            renderSkewT(profile);
-        } catch (error) {
-            console.warn('Sounding fetch failed:', error);
-            lastProfile = null;
-            statusEl.textContent = error?.message || 'Unable to load sounding';
-            statusEl.classList.add('error');
-            const ctx = canvasEl?.getContext('2d');
-            if (ctx && canvasEl) {
-                ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-            }
+    function syncToValidTime(validTime) {
+        if (!panelOpen || !Number.isFinite(pinLat) || !Number.isFinite(pinLon)) {
+            return;
         }
+        // During scrubbing/playback, reuse the cached day payload so updates stay snappy.
+        loadProfileForPin(validTime, { showLoading: false });
     }
 
     function close() {
         ensureUi();
         if (!panelEl) return;
         endResizeDrag();
+        loadGeneration += 1;
         panelEl.classList.add('hidden');
         panelEl.setAttribute('aria-hidden', 'true');
         document.body.classList.remove('sounding-panel-open');
@@ -973,6 +1375,8 @@
         pinLon = null;
         lastProfile = null;
         lastPlot = null;
+        lastValidTimeIso = null;
+        lockedAxes = null;
         hideHoverReadout();
         if (metaEl) {
             metaEl.textContent = toolEnabled
@@ -1000,6 +1404,7 @@
         setToolEnabled,
         renderSkewT,
         syncPin,
+        syncToValidTime,
     };
 
     if (document.readyState === 'loading') {

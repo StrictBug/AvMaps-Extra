@@ -937,6 +937,15 @@ function updateImages() {
     updateCurrentTimestepDisplay(framePair);
 
     updateDecodeWindowsForAllStreams(currentFrame);
+
+    // Keep an open sounding locked to the displayed forecast valid time.
+    if (window.SoundingViewer?.isOpen?.()) {
+        const validTime = getValidDateForFramePair(framePair);
+        if (validTime instanceof Date && !Number.isNaN(validTime.getTime())) {
+            window.SoundingViewer.syncToValidTime?.(validTime);
+        }
+        window.SoundingViewer.syncPin?.();
+    }
 }
 
 function getDisplayedImageContentBox(img) {
@@ -1396,7 +1405,7 @@ function setupEventListeners() {
             return;
         }
 
-        if (event.key === 's' || event.key === 'S') {
+        if (event.key === 'b' || event.key === 'B') {
             if (window.SoundingViewer?.setToolEnabled && window.SoundingViewer?.isToolEnabled) {
                 window.SoundingViewer.setToolEnabled(!window.SoundingViewer.isToolEnabled());
                 event.preventDefault();

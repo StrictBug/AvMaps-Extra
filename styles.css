@@ -174,7 +174,7 @@ body.sounding-panel-open .sounding-panel {
 .map-expand-btn {
     position: absolute;
     top: 6px;
-    right: 6px;
+    left: 6px;
     z-index: 4;
     width: 26px;
     height: 26px;
