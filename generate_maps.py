@@ -143,6 +143,14 @@ LEGEND_CONFIG = {
                         {'color': '#ed2891', 'label': '18000-20000+'},
                     ],
                 },
+                {
+                    'id': 'airmass-4c-marginal-icing',
+                    'label': 'Marginal icing',
+                    'units': 'hatch',
+                    'items': [
+                        {'pattern': 'crosshatch', 'label': 'Mean RH 95%+ between 0C and 4C'},
+                    ],
+                },
             ],
         },
     },
@@ -1017,24 +1025,34 @@ def calculate_snow_precipitation_1h(data):
     return snow_precip
 
 
-def calculate_icing_relative_humidity(data):
-    """Return mean RH (%) between the 0C and -15C isotherm layer."""
+def calculate_layer_mean_relative_humidity(data, temp_min_c, temp_max_c):
+    """Return mean RH (%) across isobaric levels where temp_min_c <= T <= temp_max_c."""
     temp_isobaric_c = get_time_index(data['Temperature_isobaric']).values - 273.15
     rh_isobaric = get_time_index(data['Relative_humidity_isobaric']).values
 
-    in_icing_layer = (
-        (temp_isobaric_c <= 0.0)
-        & (temp_isobaric_c >= -15.0)
+    in_layer = (
+        (temp_isobaric_c <= temp_max_c)
+        & (temp_isobaric_c >= temp_min_c)
         & np.isfinite(rh_isobaric)
     )
 
-    rh_sum = np.sum(np.where(in_icing_layer, rh_isobaric, 0.0), axis=0)
-    rh_count = np.sum(in_icing_layer, axis=0)
+    rh_sum = np.sum(np.where(in_layer, rh_isobaric, 0.0), axis=0)
+    rh_count = np.sum(in_layer, axis=0)
 
     mean_rh = np.full(rh_sum.shape, np.nan, dtype=float)
     valid = rh_count > 0
     mean_rh[valid] = rh_sum[valid] / rh_count[valid]
     return mean_rh
+
+
+def calculate_icing_relative_humidity(data):
+    """Return mean RH (%) between the 0C and -15C isotherm layer."""
+    return calculate_layer_mean_relative_humidity(data, -15.0, 0.0)
+
+
+def calculate_marginal_icing_relative_humidity(data):
+    """Return mean RH (%) between the 0C and 4C isotherm layer."""
+    return calculate_layer_mean_relative_humidity(data, 0.0, 4.0)
 
 
 def calculate_estimated_snow_level_m(data):
@@ -2262,6 +2280,36 @@ def plot_map(data, init_time, forecast_hour, model_name='GFS', layer_profile='bg
         iso_labels = ax.clabel(cs_iso, inline=True, fontsize=7, fmt='%d ft')
         for label in iso_labels:
             label.set_zorder(50.1)
+
+        # Marginal icing: mean RH between 0C and 4C as hatched fill + dashed outline.
+        marginal_icing_rh = calculate_marginal_icing_relative_humidity(data)
+        marginal_icing_mask = (np.isfinite(marginal_icing_rh) & (marginal_icing_rh >= 95.0)).astype(float)
+        hatch_overlay = ax.contourf(
+            data.longitude,
+            data.latitude,
+            marginal_icing_mask,
+            levels=[0.5, 1.5],
+            colors=[(0.0, 0.0, 0.0, 0.0)],
+            hatches=['///'],
+            transform=ccrs.PlateCarree(),
+            zorder=55,
+        )
+        hatch_overlay.set_facecolors([(0.0, 0.0, 0.0, 0.0)])
+        hatch_overlay.set_edgecolors([(0.0, 0.35, 0.55, 0.55)])
+        # Suppress solid polygon borders from contourf while keeping hatch strokes.
+        hatch_overlay.set_linewidth(0.0)
+
+        ax.contour(
+            data.longitude,
+            data.latitude,
+            marginal_icing_mask,
+            levels=[0.5],
+            colors=[(0.0, 0.25, 0.45, 0.95)],
+            linewidths=1.1,
+            linestyles=[(0, (5, 3))],
+            transform=ccrs.PlateCarree(),
+            zorder=55.1,
+        )
 
     if airmass_fzl_profile:
         freezing_level_ft = calculate_freezing_level_height_ft(data)

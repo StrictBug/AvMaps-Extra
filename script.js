@@ -104,6 +104,14 @@ const FALLBACK_LEGENDS = {
                         { color: '#ed2891', label: '18000-20000+' },
                     ],
                 },
+                {
+                    id: 'airmass-4c-marginal-icing',
+                    label: 'Marginal icing',
+                    units: 'hatch',
+                    items: [
+                        { pattern: 'crosshatch', label: 'Mean RH 95%+ between 0C and 4C' },
+                    ],
+                },
             ],
         },
     },
